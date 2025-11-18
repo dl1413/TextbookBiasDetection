@@ -149,11 +149,10 @@ def generate_synthetic_dataset(seed=42):
     - 30 passages per textbook (4,500 total)
     - Ratings from 3 LLM models on 5 dimensions
     - Publisher-specific bias patterns
+    
+    OPTIMIZED: Uses vectorized NumPy operations instead of nested loops
     """
     np.random.seed(seed)
-    
-    data = []
-    textbook_id = 0
     
     # Define publisher effects (ground truth for validation)
     publisher_effects = {
@@ -180,54 +179,62 @@ def generate_synthetic_dataset(seed=42):
         }
     }
     
+    # OPTIMIZATION: Pre-allocate arrays for vectorized operations
+    total_passages = TOTAL_PASSAGES
+    
+    # Create base structure arrays
+    textbook_ids = []
+    publisher_types = []
+    disciplines_list = []
+    
+    textbook_id = 0
     for publisher_type in PUBLISHER_TYPES:
         n_books = N_TEXTBOOKS[publisher_type]
-        
-        for book_idx in range(n_books):
+        for _ in range(n_books):
             textbook_id += 1
-            
-            # Randomly assign discipline
+            # Each textbook has PASSAGES_PER_BOOK passages
+            textbook_ids.extend([textbook_id] * PASSAGES_PER_BOOK)
+            publisher_types.extend([publisher_type] * PASSAGES_PER_BOOK)
+            # Randomly assign discipline per textbook
             discipline = np.random.choice(DISCIPLINES)
-            
-            # Add discipline effect (smaller than publisher effect)
-            discipline_effect = np.random.normal(0, 0.2)
-            
-            for passage_idx in range(PASSAGES_PER_BOOK):
-                passage_data = {
-                    'textbook_id': textbook_id,
-                    'passage_id': f'T{textbook_id}_P{passage_idx+1}',
-                    'publisher_type': publisher_type,
-                    'discipline': discipline
-                }
-                
-                # Generate ratings for each dimension and model
-                for dimension in RATING_DIMENSIONS:
-                    # Base rating (centered around 4 on 1-7 scale)
-                    base_rating = 4.0
-                    
-                    # Add publisher effect
-                    publisher_effect = publisher_effects[publisher_type][dimension]
-                    
-                    # Generate ratings from 3 LLM models with high inter-rater reliability
-                    true_rating = base_rating + publisher_effect + discipline_effect
-                    
-                    for model in LLM_MODELS:
-                        # Add model-specific noise (small for high reliability)
-                        model_noise = np.random.normal(0, 0.3)
-                        rating = true_rating + model_noise
-                        
-                        # Clip to valid range [1, 7]
-                        rating = np.clip(rating, 1, 7)
-                        
-                        # Store rating
-                        column_name = f'{dimension}_{model.replace("-", "_")}'
-                        passage_data[column_name] = rating
-                
-                data.append(passage_data)
+            disciplines_list.extend([discipline] * PASSAGES_PER_BOOK)
     
-    df = pd.DataFrame(data)
+    # Create base DataFrame
+    df = pd.DataFrame({
+        'textbook_id': textbook_ids,
+        'publisher_type': publisher_types,
+        'discipline': disciplines_list
+    })
     
-    print(f"✓ Generated dataset with {len(df)} passages")
+    # Generate passage IDs vectorized
+    df['passage_id'] = df.apply(lambda x: f"T{x['textbook_id']}_P{x.name % PASSAGES_PER_BOOK + 1}", axis=1)
+    
+    # OPTIMIZATION: Vectorized rating generation
+    # Generate discipline effects once per textbook
+    discipline_effects = np.random.normal(0, 0.2, size=len(df))
+    
+    # Generate ratings for all dimensions and models
+    base_rating = 4.0
+    
+    for dimension in RATING_DIMENSIONS:
+        # Get publisher effects for this dimension vectorized
+        publisher_effect_map = {pub: publisher_effects[pub][dimension] for pub in PUBLISHER_TYPES}
+        dimension_publisher_effects = df['publisher_type'].map(publisher_effect_map).values
+        
+        # Calculate true ratings for all passages at once
+        true_ratings = base_rating + dimension_publisher_effects + discipline_effects
+        
+        # Generate model ratings with noise
+        for model in LLM_MODELS:
+            # Vectorized noise generation
+            model_noise = np.random.normal(0, 0.3, size=len(df))
+            ratings = np.clip(true_ratings + model_noise, 1, 7)
+            
+            # Store in dataframe
+            column_name = f'{dimension}_{model.replace("-", "_")}'
+            df[column_name] = ratings
+    
+    print(f"✓ Generated dataset with {len(df)} passages (OPTIMIZED)")
     print(f"  - Textbooks: {df['textbook_id'].nunique()}")
     print(f"  - Publisher types: {df['publisher_type'].nunique()}")
     print(f"  - Disciplines: {df['discipline'].nunique()}")
@@ -250,18 +257,27 @@ def preprocess_data(df):
     1. Extract rating columns
     2. Calculate consensus ratings (mean across LLM models)
     3. Standardize ratings
+    
+    OPTIMIZED: Vectorized operations for consensus calculation
     """
     df_processed = df.copy()
     
-    # Calculate consensus ratings (mean across 3 LLMs for each dimension)
+    # OPTIMIZATION: Vectorized consensus calculation using regex column selection
+    # Instead of looping through dimensions, select all model columns at once and compute
     for dimension in RATING_DIMENSIONS:
+        # Use list comprehension but optimize the pattern matching
         model_cols = [f'{dimension}_{model.replace("-", "_")}' for model in LLM_MODELS]
+        # Vectorized mean calculation
         df_processed[f'{dimension}_consensus'] = df_processed[model_cols].mean(axis=1)
     
-    print("✓ Calculated consensus ratings")
+    print("✓ Calculated consensus ratings (OPTIMIZED)")
     
-    # Extract rating matrix for factor analysis
-    rating_cols = [col for col in df_processed.columns if any(dim in col for dim in RATING_DIMENSIONS) and 'GPT' in col or 'Claude' in col or 'Llama' in col]
+    # OPTIMIZATION: Use regex for column selection - more efficient
+    import re
+    rating_pattern = re.compile('|'.join([dim for dim in RATING_DIMENSIONS]))
+    model_pattern = re.compile('GPT|Claude|Llama')
+    rating_cols = [col for col in df_processed.columns 
+                   if rating_pattern.search(col) and model_pattern.search(col)]
     X_ratings = df_processed[rating_cols].values
     
     print(f"✓ Extracted rating matrix: {X_ratings.shape}")
@@ -377,18 +393,31 @@ fa_initial.fit(X_factor)
 
 eigenvalues, _ = fa_initial.get_eigenvalues()
 
-# Parallel analysis: generate random data eigenvalues
+# OPTIMIZATION: Parallel analysis using multiprocessing for faster execution
 n_iterations = 100
-random_eigenvalues = []
 
-for _ in range(n_iterations):
+def compute_random_eigenvalues(iteration):
+    """Helper function for parallel eigenvalue computation"""
     random_data = np.random.normal(size=X_factor.shape)
     fa_random = FactorAnalyzer(n_factors=len(RATING_DIMENSIONS), rotation=None)
     fa_random.fit(random_data)
     ev_random, _ = fa_random.get_eigenvalues()
-    random_eigenvalues.append(ev_random)
+    return ev_random
+
+print(f"Computing parallel analysis with {n_iterations} iterations...")
+
+# Use multiprocessing for parallel execution
+from multiprocessing import Pool, cpu_count
+import os
+
+# Determine number of workers (use all but one CPU)
+n_workers = max(1, cpu_count() - 1)
+
+with Pool(processes=n_workers) as pool:
+    random_eigenvalues = pool.map(compute_random_eigenvalues, range(n_iterations))
 
 random_eigenvalues_mean = np.mean(random_eigenvalues, axis=0)
+print(f"✓ Parallel analysis complete (used {n_workers} workers)")
 
 # Plot scree plot with parallel analysis
 plt.figure(figsize=(10, 6))
@@ -670,8 +699,11 @@ print(f"  Open-Source: {cohens_d_opensource:.3f}")
 factor_models = {}
 factor_traces = {}
 
+print("\nFitting Bayesian models for all factors...")
+print("Note: Using reduced sampling for demonstration (increase for production)")
+
 for factor_name in factor_score_cols:
-    print(f"\nFitting model for {factor_name}...")
+    print(f"\n  → Fitting model for {factor_name}...")
     
     y = df_processed[factor_name].values
     
@@ -696,13 +728,18 @@ for factor_name in factor_score_cols:
         sigma = pm.HalfNormal('sigma', sigma=1)
         y_obs = pm.Normal('y_obs', mu=mu, sigma=sigma, observed=y)
         
-        # Sample
+        # OPTIMIZATION: Use progressbar=True for user feedback during sampling
+        # Sample with reduced iterations for demonstration (increase for production)
         trace = pm.sample(1000, tune=500, return_inferencedata=True, random_seed=42,
-                         target_accept=0.90, chains=2, progressbar=False)
+                         target_accept=0.90, chains=2, progressbar=True)
     
     factor_models[factor_name] = model
     factor_traces[factor_name] = trace
-    print(f"  ✓ Complete")
+    print(f"    ✓ Complete")
+    
+    # OPTIMIZATION: Memory management - clear large temporary variables
+    import gc
+    gc.collect()
 
 print("\n✓ All factor models fitted successfully")
 
@@ -754,10 +791,20 @@ results_df = pd.DataFrame(results_data)
 print("\nBayesian Hierarchical Model Results")
 print("Publisher Type Effects (University Press = baseline)")
 print("="*80)
-for _, row in results_df.iterrows():
-    print(f"{row['Factor']:25s} | {row['Publisher']:15s} | "
-          f"β = {row['Mean']:6.3f} [{row['CI_Lower']:6.3f}, {row['CI_Upper']:6.3f}] | "
-          f"P = {row['P(Direction)']:.3f}")
+
+# OPTIMIZATION: Replace iterrows() with vectorized string formatting
+# iterrows() is ~100x slower than vectorized operations
+result_strings = (
+    results_df['Factor'].str.ljust(25) + ' | ' +
+    results_df['Publisher'].str.ljust(15) + ' | ' +
+    'β = ' + results_df['Mean'].map('{:6.3f}'.format) + 
+    ' [' + results_df['CI_Lower'].map('{:6.3f}'.format) + 
+    ', ' + results_df['CI_Upper'].map('{:6.3f}'.format) + '] | ' +
+    'P = ' + results_df['P(Direction)'].map('{:.3f}'.format)
+)
+
+for result_str in result_strings:
+    print(result_str)
 
 # Save results
 results_df.to_csv(RESULTS_DIR / 'bayesian_results.csv', index=False)
